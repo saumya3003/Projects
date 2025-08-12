@@ -1,0 +1,411 @@
+# Project: Healthcare Appointment App
+
+This canvas contains all the essential files for a backend-focused Healthcare Appointment System (MySQL + PHP + Python scripts + Postman collection). Copy each file into your project folders exactly as named.
+
+--- FILE: database/schema.sql ---
+-- MySQL schema for Healthcare Appointment App
+
+CREATE DATABASE IF NOT EXISTS healthcare_app;
+USE healthcare_app;
+
+-- Users table: stores patients, doctors, admins
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(100) NOT NULL UNIQUE,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password VARCHAR(255) NOT NULL,
+  role ENUM('admin','doctor','patient') NOT NULL DEFAULT 'patient',
+  full_name VARCHAR(255),
+  specialization VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Appointments table
+CREATE TABLE IF NOT EXISTS appointments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  patient_id INT NOT NULL,
+  doctor_id INT NOT NULL,
+  start_time DATETIME NOT NULL,
+  end_time DATETIME NOT NULL,
+  status ENUM('booked','completed','cancelled') DEFAULT 'booked',
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (patient_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (doctor_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Indexes for faster lookups
+CREATE INDEX idx_appointments_doctor_time ON appointments(doctor_id, start_time);
+
+--- FILE: backend/config.php ---
+<?php
+// Configuration file - update with your credentials
+return [
+    'db_host' => '127.0.0.1',
+    'db_name' => 'healthcare_app',
+    'db_user' => 'root',
+    'db_pass' => '',
+    'base_url' => 'http://localhost/healthcare-appointment-app/backend'
+];
+
+--- FILE: backend/db.php ---
+<?php
+// Simple PDO wrapper
+$config = require __DIR__ . '/config.php';
+
+try {
+    $dsn = "mysql:host={$config['db_host']};dbname={$config['db_name']};charset=utf8mb4";
+    $pdo = new PDO($dsn, $config['db_user'], $config['db_pass'], [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+    ]);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Database connection failed: ' . $e->getMessage()]);
+    exit;
+}
+
+function jsonResponse($data, $status = 200) {
+    header('Content-Type: application/json');
+    http_response_code($status);
+    echo json_encode($data);
+    exit;
+}
+
+--- FILE: backend/helpers.php ---
+<?php
+require_once __DIR__ . '/db.php';
+
+function hashPassword($password) {
+    return password_hash($password, PASSWORD_BCRYPT);
+}
+
+function verifyPassword($password, $hash) {
+    return password_verify($password, $hash);
+}
+
+function getUserByEmail($email) {
+    global $pdo;
+    $stmt = $pdo->prepare('SELECT id, username, email, password, role, full_name, specialization FROM users WHERE email = ?');
+    $stmt->execute([$email]);
+    return $stmt->fetch();
+}
+
+function getUserById($id) {
+    global $pdo;
+    $stmt = $pdo->prepare('SELECT id, username, email, role, full_name, specialization FROM users WHERE id = ?');
+    $stmt->execute([$id]);
+    return $stmt->fetch();
+}
+
+--- FILE: backend/auth_register.php ---
+<?php
+require_once __DIR__ . '/helpers.php';
+
+// Expect JSON body
+$input = json_decode(file_get_contents('php://input'), true);
+if (!$input) jsonResponse(['error' => 'Invalid JSON body'], 400);
+
+$username = trim($input['username'] ?? '');
+$email = trim($input['email'] ?? '');
+$password = $input['password'] ?? '';
+$role = $input['role'] ?? 'patient';
+$full_name = $input['full_name'] ?? null;
+$specialization = $input['specialization'] ?? null;
+
+if (!$username || !$email || !$password) {
+    jsonResponse(['error' => 'username, email and password required'], 400);
+}
+
+// Check if email exists
+if (getUserByEmail($email)) jsonResponse(['error' => 'Email already registered'], 409);
+
+$hash = hashPassword($password);
+
+$stmt = $pdo->prepare('INSERT INTO users (username, email, password, role, full_name, specialization) VALUES (?, ?, ?, ?, ?, ?)');
+try {
+    $stmt->execute([$username, $email, $hash, $role, $full_name, $specialization]);
+    $id = $pdo->lastInsertId();
+    $user = getUserById($id);
+    unset($user['password']);
+    jsonResponse(['message' => 'User registered', 'user' => $user], 201);
+} catch (Exception $e) {
+    jsonResponse(['error' => $e->getMessage()], 500);
+}
+
+--- FILE: backend/auth_login.php ---
+<?php
+require_once __DIR__ . '/helpers.php';
+
+$input = json_decode(file_get_contents('php://input'), true);
+if (!$input) jsonResponse(['error' => 'Invalid JSON body'], 400);
+
+$email = trim($input['email'] ?? '');
+$password = $input['password'] ?? '';
+
+if (!$email || !$password) jsonResponse(['error' => 'email and password required'], 400);
+
+$user = getUserByEmail($email);
+if (!$user) jsonResponse(['error' => 'Invalid credentials'], 401);
+
+if (!verifyPassword($password, $user['password'])) jsonResponse(['error' => 'Invalid credentials'], 401);
+
+// For simplicity, we return a basic token (NOT JWT). In production use JWT or server sessions.
+$token = base64_encode("{$user['id']}:" . bin2hex(random_bytes(16)));
+
+// Save token in a simple tokens table (optional). We'll just return token.
+
+unset($user['password']);
+jsonResponse(['message' => 'Login successful', 'token' => $token, 'user' => $user]);
+
+--- FILE: backend/middleware_auth.php ---
+<?php
+// Simple token-based middleware for demo purposes
+// In requests, include header: Authorization: Bearer <token>
+
+function requireAuth() {
+    $headers = getallheaders();
+    $auth = $headers['Authorization'] ?? $headers['authorization'] ?? null;
+    if (!$auth) {
+        jsonResponse(['error' => 'Missing Authorization header'], 401);
+    }
+    if (!preg_match('/Bearer\s+(.*)$/i', $auth, $matches)) {
+        jsonResponse(['error' => 'Invalid Authorization header'], 401);
+    }
+    $token = $matches[1];
+    // decode mock token to get user id
+    $decoded = base64_decode($token);
+    if (!$decoded) jsonResponse(['error' => 'Invalid token'], 401);
+    $parts = explode(':', $decoded);
+    $userId = intval($parts[0] ?? 0);
+    if (!$userId) jsonResponse(['error' => 'Invalid token payload'], 401);
+    // Fetch user
+    $user = getUserById($userId);
+    if (!$user) jsonResponse(['error' => 'User not found'], 401);
+    return $user;
+}
+
+--- FILE: backend/appointments.php ---
+<?php
+require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/middleware_auth.php';
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = $_GET['action'] ?? null; // use ?action=list or ?action=book etc.
+
+// GET /appointments?action=list&doctor_id=1
+if ($method === 'GET' && $path === 'list') {
+    $doctor_id = isset($_GET['doctor_id']) ? intval($_GET['doctor_id']) : null;
+    $patient_id = isset($_GET['patient_id']) ? intval($_GET['patient_id']) : null;
+
+    $query = 'SELECT a.*, p.full_name as patient_name, d.full_name as doctor_name, d.specialization FROM appointments a JOIN users p ON a.patient_id = p.id JOIN users d ON a.doctor_id = d.id';
+    $conds = [];
+    $params = [];
+    if ($doctor_id) { $conds[] = 'a.doctor_id = ?'; $params[] = $doctor_id; }
+    if ($patient_id) { $conds[] = 'a.patient_id = ?'; $params[] = $patient_id; }
+    if ($conds) $query .= ' WHERE ' . join(' AND ', $conds);
+    $query .= ' ORDER BY a.start_time DESC';
+
+    $stmt = $pdo->prepare($query);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll();
+    jsonResponse(['appointments' => $rows]);
+}
+
+// POST /appointments?action=book
+if ($method === 'POST' && $path === 'book') {
+    $user = requireAuth();
+    $body = json_decode(file_get_contents('php://input'), true);
+    $patient_id = $body['patient_id'] ?? null;
+    $doctor_id = $body['doctor_id'] ?? null;
+    $start_time = $body['start_time'] ?? null; // datetime string
+    $end_time = $body['end_time'] ?? null;
+    $notes = $body['notes'] ?? null;
+
+    if (!$patient_id || !$doctor_id || !$start_time || !$end_time) jsonResponse(['error' => 'Missing fields'], 400);
+
+    // Only patient or admin can book for patient; doctors can create slots? For simplicity, allow booking if user is patient or admin
+    if (!in_array($user['role'], ['patient','admin']) && $user['role'] === 'doctor') {
+        jsonResponse(['error' => 'Unauthorized role to book'], 403);
+    }
+
+    // Check for conflicts for the doctor
+    $stmt = $pdo->prepare('SELECT COUNT(*) as cnt FROM appointments WHERE doctor_id = ? AND ((start_time < ? AND end_time > ?) OR (start_time >= ? AND start_time < ?))');
+    $stmt->execute([$doctor_id, $end_time, $start_time, $start_time, $end_time]);
+    $c = $stmt->fetch();
+    if ($c['cnt'] > 0) jsonResponse(['error' => 'Doctor has a conflicting appointment'], 409);
+
+    // Insert
+    $stmt = $pdo->prepare('INSERT INTO appointments (patient_id, doctor_id, start_time, end_time, notes) VALUES (?, ?, ?, ?, ?)');
+    try {
+        $stmt->execute([$patient_id, $doctor_id, $start_time, $end_time, $notes]);
+        $id = $pdo->lastInsertId();
+        $stmt2 = $pdo->prepare('SELECT * FROM appointments WHERE id = ?');
+        $stmt2->execute([$id]);
+        $row = $stmt2->fetch();
+        jsonResponse(['message' => 'Booked', 'appointment' => $row], 201);
+    } catch (Exception $e) {
+        jsonResponse(['error' => $e->getMessage()], 500);
+    }
+}
+
+// PUT /appointments?action=update&id=123
+if ($method === 'PUT' && $path === 'update') {
+    $user = requireAuth();
+    parse_str(file_get_contents('php://input'), $input);
+    $id = intval($_GET['id'] ?? 0);
+    if (!$id) jsonResponse(['error' => 'Missing id'], 400);
+
+    $start_time = $input['start_time'] ?? null;
+    $end_time = $input['end_time'] ?? null;
+    $status = $input['status'] ?? null;
+
+    // Fetch appointment
+    $stmt = $pdo->prepare('SELECT * FROM appointments WHERE id = ?');
+    $stmt->execute([$id]);
+    $appt = $stmt->fetch();
+    if (!$appt) jsonResponse(['error' => 'Appointment not found'], 404);
+
+    // Only admin, patient owning the appointment or the doctor can update
+    if (!in_array($user['role'], ['admin']) && $user['id'] != $appt['patient_id'] && $user['id'] != $appt['doctor_id']) {
+        jsonResponse(['error' => 'Unauthorized'], 403);
+    }
+
+    $params = [];
+    $sets = [];
+    if ($start_time && $end_time) {
+        // check conflict
+        $stmtc = $pdo->prepare('SELECT COUNT(*) as cnt FROM appointments WHERE doctor_id = ? AND id != ? AND ((start_time < ? AND end_time > ?) OR (start_time >= ? AND start_time < ?))');
+        $stmtc->execute([$appt['doctor_id'], $id, $end_time, $start_time, $start_time, $end_time]);
+        $c = $stmtc->fetch();
+        if ($c['cnt'] > 0) jsonResponse(['error' => 'Doctor has a conflicting appointment'], 409);
+        $sets[] = 'start_time = ?'; $params[] = $start_time;
+        $sets[] = 'end_time = ?'; $params[] = $end_time;
+    }
+    if ($status) { $sets[] = 'status = ?'; $params[] = $status; }
+    if (empty($sets)) jsonResponse(['error' => 'Nothing to update'], 400);
+    $params[] = $id;
+
+    $sql = 'UPDATE appointments SET ' . join(', ', $sets) . ' WHERE id = ?';
+    $stmtu = $pdo->prepare($sql);
+    try {
+        $stmtu->execute($params);
+        $stmt2 = $pdo->prepare('SELECT * FROM appointments WHERE id = ?');
+        $stmt2->execute([$id]);
+        jsonResponse(['message' => 'Updated', 'appointment' => $stmt2->fetch()]);
+    } catch (Exception $e) {
+        jsonResponse(['error' => $e->getMessage()], 500);
+    }
+}
+
+// DELETE /appointments?action=cancel&id=123
+if ($method === 'DELETE' && $path === 'cancel') {
+    $user = requireAuth();
+    $id = intval($_GET['id'] ?? 0);
+    if (!$id) jsonResponse(['error' => 'Missing id'], 400);
+    $stmt = $pdo->prepare('SELECT * FROM appointments WHERE id = ?');
+    $stmt->execute([$id]);
+    $appt = $stmt->fetch();
+    if (!$appt) jsonResponse(['error' => 'Appointment not found'], 404);
+    if (!in_array($user['role'], ['admin']) && $user['id'] != $appt['patient_id']) {
+        jsonResponse(['error' => 'Unauthorized to cancel'], 403);
+    }
+    $stmt = $pdo->prepare('UPDATE appointments SET status = ? WHERE id = ?');
+    $stmt->execute(['cancelled', $id]);
+    jsonResponse(['message' => 'Cancelled']);
+}
+
+// Fallback
+jsonResponse(['error' => 'Invalid endpoint or method'], 400);
+
+--- FILE: scripts/report.py ---
+#!/usr/bin/env python3
+"""Simple reporting script that connects to MySQL and prints counts per doctor."""
+import mysql.connector
+import os
+
+DB_HOST = os.getenv('DB_HOST', '127.0.0.1')
+DB_USER = os.getenv('DB_USER', 'root')
+DB_PASS = os.getenv('DB_PASS', '')
+DB_NAME = os.getenv('DB_NAME', 'healthcare_app')
+
+cnx = mysql.connector.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
+cur = cnx.cursor(dictionary=True)
+
+query = """
+SELECT d.id as doctor_id, d.full_name as doctor_name, d.specialization, COUNT(a.id) as total_appointments,
+SUM(CASE WHEN a.status='booked' THEN 1 ELSE 0 END) as booked_count,
+SUM(CASE WHEN a.status='completed' THEN 1 ELSE 0 END) as completed_count
+FROM users d
+LEFT JOIN appointments a ON a.doctor_id = d.id
+WHERE d.role = 'doctor'
+GROUP BY d.id
+ORDER BY total_appointments DESC
+"""
+cur.execute(query)
+rows = cur.fetchall()
+print('Doctor, Spec, Total, Booked, Completed')
+for r in rows:
+    print(f"{r['doctor_name']}, {r['specialization']}, {r['total_appointments']}, {r['booked_count']}, {r['completed_count']}")
+
+cur.close()
+cnx.close()
+
+--- FILE: tests/HealthcareApp.postman_collection.json ---
+{
+  "info": {
+    "name": "Healthcare App Collection",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Register User",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"patient1\",\n  \"email\": \"patient1@example.com\",\n  \"password\": \"password123\",\n  \"role\": \"patient\",\n  \"full_name\": \"Patient One\"\n}"
+        },
+        "url": { "raw": "{{base_url}}/auth_register.php", "host": ["{{base_url}}"], "path": ["auth_register.php"] }
+      }
+    },
+    {
+      "name": "Login User",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"email\": \"patient1@example.com\",\n  \"password\": \"password123\"\n}" },
+        "url": { "raw": "{{base_url}}/auth_login.php", "host": ["{{base_url}}"], "path": ["auth_login.php"] }
+      }
+    },
+    {
+      "name": "Book Appointment",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{token}}" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"patient_id\": 1,\n  \"doctor_id\": 2,\n  \"start_time\": \"2025-08-20 10:00:00\",\n  \"end_time\": \"2025-08-20 10:30:00\",\n  \"notes\": \"First visit\"\n}" },
+        "url": { "raw": "{{base_url}}/appointments.php?action=book", "host": ["{{base_url}}"], "path": ["appointments.php"], "query": [{"key":"action","value":"book"}] }
+      }
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost/healthcare-appointment-app/backend" },
+    { "key": "token", "value": "" }
+  ]
+}
+
+--- FILE: README-USE.md ---
+# Quick Usage
+1. Import `database/schema.sql` into your MySQL server (e.g., using phpMyAdmin or `mysql -u root -p healthcare_app < schema.sql`).
+2. Put the `backend/` folder inside your web server document root.
+3. Update `backend/config.php` with database credentials.
+4. Start the server (XAMPP/WAMP/MAMP) and visit Postman to test endpoints. Set `{{base_url}}` to your backend path.
+5. Register users (doctors must be created with role 'doctor') and then book appointments.
+
+--- END OF FILES ---
+
+# Notes
+- This is a minimal, demonstration-ready backend. For production you'll need JWT sessions, secure token storage, input validation libraries, CSRF protections, HTTPS, and better error handling.
+- To run the Python script, install `mysql-connector-python` (pip install mysql-connector-python).
+
